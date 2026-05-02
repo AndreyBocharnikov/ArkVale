@@ -149,7 +149,7 @@ def _arkvale_attn_forward(
     value_states = value_states.view(bsz, q_len, n_kv_heads, head_dim)
 
     kvc = state.kv_caches[cur_id]
-    budget = state.layer2budget[cur_id]
+    budget = kvc.budget
 
     n_pf_layers = state.n_prefetch_layers
     assert n_pf_layers is None or not n_pf_layers

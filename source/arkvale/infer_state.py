@@ -70,12 +70,15 @@ class InferState:
         self.page_size = page_size
         self.n_max_pages = n_max_pages
         self.layer2budget = page_budgets
+        self.layer2base_budget = list(page_budgets)
         self.budget2layers = defaultdict(list)
         for i, b in enumerate(page_budgets):
             self.budget2layers[b].append(i)
         self.layer2topk = page_topks
         self.n_sink_pages = n_sink_pages
         self.n_win_pages = n_win_pages
+        self.layer2base_nw = [n_win_pages] * n_layers
+        self.prefill_n_pages = 0
         assert n_win_pages >= 2
         self.use_sparse_attn = use_sparse_attn
 
@@ -159,6 +162,35 @@ class InferState:
         self.group_size = group_size
         self.n_groups = n_groups
 
+    def _update_decode_runtime_params(self, pending_new_page: bool = False):
+        for i, kvc in enumerate(self.kv_caches):
+            base_budget = self.layer2base_budget[i]
+            if base_budget is None:
+                continue
+            gen_pages = max(0, kvc.n_pages - self.prefill_n_pages)
+            if pending_new_page:
+                gen_pages += 1
+            kvc.n_win_pages = self.layer2base_nw[i] + gen_pages
+            kvc.budget = base_budget + gen_pages
+
+    def _ensure_topk_workspace(self, bsz1: int, topk: int, budget: int, nw: int):
+        need_topk_dout = bsz1 * topk
+        if self.topk_dout is None or self.topk_dout.numel() < need_topk_dout:
+            self.topk_dout = torch.empty([need_topk_dout], **self._fp)
+
+        eids_range = topk + self.n_sink_pages + nw
+        need_topk_iout = bsz1 * eids_range
+        if self.topk_iout is None or self.topk_iout.numel() < need_topk_iout:
+            self.topk_iout = torch.empty([need_topk_iout], **self._i32)
+
+        need_topk_newi = bsz1 * budget
+        if self.topk_newi is None or self.topk_newi.numel() < need_topk_newi:
+            self.topk_newi = torch.empty([need_topk_newi], **self._fp)
+
+        need_topk_rids = bsz1 * (topk + 1)
+        if self.topk_rids is None or self.topk_rids.numel() < need_topk_rids:
+            self.topk_rids = torch.empty([need_topk_rids], **self._i32)
+
     @property
     def seq_len(self):
         return self.kv_caches[0].seq_len
@@ -203,11 +235,12 @@ class InferState:
         )
         self.topk_newi = torch.empty([bsz1 * max_cap], **self._fp)
         self.topk_rids = torch.empty([bsz1 * (max_topk + 1)], **self._i32)
-        self.topk_buff = torch.empty([bsz1, 1 << 10], **self._u8)
+        self.topk_buff = torch.empty([bsz1, 1 << 12], **self._u8)
 
         # we do not pre-allocate real kv-pages before prefill
         [kvc.prefill_alloc_n_tokens(q_len) for kvc in self.cpu_kv_caches if kvc]
         n_kv_pages = (q_len + self.page_size - 1) // self.page_size
+        self.prefill_n_pages = n_kv_pages
         self.kv_last_page_len = (q_len - 1) % self.page_size + 1
         self.kv_last_page_lens = torch.tensor(
             [self.kv_last_page_len] * bsz, **self._i32
@@ -255,8 +288,9 @@ class InferState:
             )
             if b is not None and self.use_sparse_attn:
                 topk = utils.all_eq(self.layer2topk[l] for l in ls)
+                nw = utils.all_eq(self.kv_caches[l].n_win_pages for l in ls)
                 n_kv_pages = min(
-                    self.n_sink_pages + topk + self.n_win_pages, n_kv_pages
+                    self.n_sink_pages + topk + nw, n_kv_pages
                 )
                 self.kv_decode_indptrs_tab[b] = torch.arange(
                     0, bsz * n_kv_pages + 1, n_kv_pages, **self._i32
@@ -266,10 +300,14 @@ class InferState:
     def _prepare_decode(self, bsz):
         if self.kv_last_page_len + 1 >= self.page_size:
             self.default_stream.wait_stream(self.decode_backup_stream)
+        self._update_decode_runtime_params(
+            pending_new_page=(self.kv_last_page_len == self.page_size)
+        )
         pre = [kvc.n_real_pages for kvc in self.kv_caches]
         n_new_kv_pages = utils.all_eq(
             kvc.decode_alloc_1_token(self.alloc_page) for kvc in self.kv_caches
         )
+        self._update_decode_runtime_params(pending_new_page=False)
         self.kv_last_page_len = utils.all_eq(
             kvc.last_page_len for kvc in self.kv_caches
         )
@@ -291,8 +329,9 @@ class InferState:
                     )
                     if b is not None and self.use_sparse_attn:
                         topk = utils.all_eq(self.layer2topk[l] for l in ls)
+                        nw = utils.all_eq(self.kv_caches[l].n_win_pages for l in ls)
                         n_kv_pages = min(
-                            self.n_sink_pages + topk + self.n_win_pages, n_kv_pages
+                            self.n_sink_pages + topk + nw, n_kv_pages
                         )
                         self.kv_decode_indptrs_tab[b] = torch.arange(
                             0, bsz * n_kv_pages + 1, n_kv_pages, **self._i32
@@ -390,11 +429,12 @@ class InferState:
 
     def select_topk(self, layer_idx: int, scores: Tensor):
         bsz = self.batch_size * self.n_groups
-        budget = self.layer2budget[layer_idx]
-        topk = self.layer2topk[layer_idx]
         kvc = self.kv_caches[layer_idx]
+        budget = kvc.budget
+        topk = self.layer2topk[layer_idx]
         ns = self.n_sink_pages
-        nw = self.n_win_pages
+        nw = kvc.n_win_pages
+        self._ensure_topk_workspace(bsz, topk, budget, nw)
         eids_range = topk + ns + nw
         dout = self.topk_dout[: bsz * topk].view(bsz, topk)
         eids = self.topk_iout[: bsz * eids_range].view(bsz, eids_range)
@@ -410,8 +450,8 @@ class InferState:
         return eids, rids
 
     def recall(self, layer_idx: int, eids: Tensor, rids: Tensor):
-        nw = self.n_win_pages
         kvc = self.kv_caches[layer_idx]
+        nw = kvc.n_win_pages
         cpu_kvc = self.cpu_kv_caches[layer_idx]
         bsz = kvc.batch_size
         gs = self.group_size
@@ -497,10 +537,11 @@ class InferState:
         if kvc.budget is None:
             return
         if kvc.n_real_pages > kvc.budget:
-            ns = max(2, kvc.n_sink_pages)
+            ns = kvc.n_sink_pages
             nw = kvc.n_win_pages
             assert ns + nw <= kvc.budget
             topk = kvc.budget - ns - nw
+            self._ensure_topk_workspace(bsz, topk, kvc.budget, nw)
             kvc.c2p = torch.empty([bsz, kvc.budget], **kvc._i32)
             kvc.gc2cc = torch.empty([bsz, kvc.budget], **kvc._i32)
             ev_gpi = kvc.cc2gp.clone()
@@ -554,4 +595,6 @@ class InferState:
         kvc = self.kv_caches[layer_idx]
         if page_ids is None:
             page_ids = kvc.c2p
-        return self.decode_handler_tab[kvc.budget].forward(q, kvc.buffer, page_ids)
+        return self.decode_handler_tab[self.layer2base_budget[layer_idx]].forward(
+            q, kvc.buffer, page_ids
+        )
