@@ -1,4 +1,5 @@
-# transformers==4.40.0
+# transformers>=5.6.1
+from typing import Union, List
 
 from transformers.generation.utils import *
 
@@ -36,7 +37,10 @@ def _3_stages_greedy_search(
             " `stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])` instead.",
             UserWarning,
         )
-        stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
+        if "validate_stopping_criteria" in globals():
+            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
+        else:
+            stopping_criteria.append(MaxLengthCriteria(max_length=max_length))
     pad_token_id = (
         pad_token_id
         if pad_token_id is not None
@@ -232,15 +236,196 @@ def _3_stages_greedy_search(
         return input_ids
 
 
-_OLD_GREEDY_SEARCH = GenerationMixin._greedy_search
+def _3_stages_sample(
+    self: GenerationMixin,
+    input_ids: torch.LongTensor,
+    logits_processor: LogitsProcessorList,
+    stopping_criteria: StoppingCriteriaList,
+    generation_config: GenerationConfig,
+    synced_gpus: bool = False,
+    streamer: Optional["BaseStreamer"] = None,
+    **model_kwargs,
+) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
+    pad_token_id = generation_config._pad_token_tensor
+    output_attentions = generation_config.output_attentions
+    output_hidden_states = generation_config.output_hidden_states
+    output_scores = generation_config.output_scores
+    output_logits = generation_config.output_logits
+    return_dict_in_generate = generation_config.return_dict_in_generate
+    has_eos_stopping_criteria = any(
+        hasattr(criteria, "eos_token_id") for criteria in stopping_criteria
+    )
+    do_sample = generation_config.do_sample
+
+    scores = () if (return_dict_in_generate and output_scores) else None
+    raw_logits = () if (return_dict_in_generate and output_logits) else None
+    decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
+    cross_attentions = () if (return_dict_in_generate and output_attentions) else None
+    decoder_hidden_states = (
+        () if (return_dict_in_generate and output_hidden_states) else None
+    )
+
+    if return_dict_in_generate and self.config.is_encoder_decoder:
+        encoder_attentions = (
+            model_kwargs["encoder_outputs"].get("attentions")
+            if output_attentions
+            else None
+        )
+        encoder_hidden_states = (
+            model_kwargs["encoder_outputs"].get("hidden_states")
+            if output_hidden_states
+            else None
+        )
+
+    batch_size = input_ids.shape[0]
+    this_peer_finished = False
+    unfinished_sequences = torch.ones(
+        batch_size, dtype=torch.long, device=input_ids.device
+    )
+
+    model_forward = (
+        self.get_compiled_call(generation_config.compile_config)
+        if self._valid_auto_compile_criteria(model_kwargs, generation_config)
+        else self.__call__
+    )
+
+    prefill_consumed = False
+    outputs = self._prefill(
+        input_ids,
+        generation_config,
+        model_kwargs,
+        is_first_iteration=not generation_config.is_assistant,
+    )
+
+    if _Q_INPUT_IDS is not None:
+        all_input_ids = torch.cat([input_ids, _Q_INPUT_IDS], dim=-1)
+        max_idx = all_input_ids.shape[-1]
+        cur_idx = input_ids.shape[-1]
+
+    while self._has_unfinished_sequences(
+        this_peer_finished, synced_gpus, device=input_ids.device
+    ):
+        if prefill_consumed:
+            next_sequence_length = 1 if model_kwargs["use_cache"] else None
+            model_inputs = self.prepare_inputs_for_generation(
+                input_ids,
+                next_sequence_length=next_sequence_length,
+                **model_kwargs,
+            )
+            with self._optimize_model_for_decode():
+                outputs = model_forward(**model_inputs, return_dict=True)
+        prefill_consumed = True
+
+        model_kwargs = self._update_model_kwargs_for_generation(
+            outputs,
+            model_kwargs,
+            is_encoder_decoder=self.config.is_encoder_decoder,
+        )
+
+        if _Q_INPUT_IDS is not None and cur_idx < max_idx:
+            cur_idx += 1
+            input_ids = all_input_ids[:, :cur_idx]
+            continue
+
+        if synced_gpus and this_peer_finished:
+            continue
+
+        next_token_logits = outputs.logits[:, -1, :].to(
+            copy=True, dtype=torch.float32, device=input_ids.device
+        )
+        next_token_scores = logits_processor(input_ids, next_token_logits)
+
+        if return_dict_in_generate:
+            if output_scores:
+                scores += (next_token_scores,)
+            if output_logits:
+                raw_logits += (next_token_logits,)
+            if output_attentions:
+                decoder_attentions += (
+                    (outputs.decoder_attentions,)
+                    if self.config.is_encoder_decoder
+                    else (outputs.attentions,)
+                )
+                if self.config.is_encoder_decoder:
+                    cross_attentions += (outputs.cross_attentions,)
+
+            if output_hidden_states:
+                decoder_hidden_states += (
+                    (outputs.decoder_hidden_states,)
+                    if self.config.is_encoder_decoder
+                    else (outputs.hidden_states,)
+                )
+
+        if do_sample:
+            probs = torch.nn.functional.softmax(next_token_scores, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        else:
+            next_tokens = torch.argmax(next_token_scores, dim=-1)
+
+        if has_eos_stopping_criteria:
+            next_tokens = next_tokens * unfinished_sequences + pad_token_id * (
+                1 - unfinished_sequences
+            )
+
+        input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+        if streamer is not None:
+            streamer.put(next_tokens.cpu())
+
+        unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
+        this_peer_finished = unfinished_sequences.max() == 0
+
+        del outputs
+
+    if streamer is not None:
+        streamer.end()
+
+    if return_dict_in_generate:
+        cache = None
+        if any(cache_key in model_kwargs for cache_key in ALL_CACHE_NAMES):
+            cache_key = next(
+                cache_key for cache_key in ALL_CACHE_NAMES if cache_key in model_kwargs
+            )
+            cache = model_kwargs[cache_key]
+        if self.config.is_encoder_decoder:
+            return GenerateEncoderDecoderOutput(
+                sequences=input_ids,
+                scores=scores,
+                logits=raw_logits,
+                encoder_attentions=encoder_attentions,
+                encoder_hidden_states=encoder_hidden_states,
+                decoder_attentions=decoder_attentions,
+                cross_attentions=cross_attentions,
+                decoder_hidden_states=decoder_hidden_states,
+                past_key_values=cache,
+            )
+        else:
+            return GenerateDecoderOnlyOutput(
+                sequences=input_ids,
+                scores=scores,
+                logits=raw_logits,
+                attentions=decoder_attentions,
+                hidden_states=decoder_hidden_states,
+                past_key_values=cache,
+            )
+    else:
+        return input_ids
+
+
+_PATCH_TARGET = (
+    "_greedy_search" if hasattr(GenerationMixin, "_greedy_search") else "_sample"
+)
+_OLD_GREEDY_SEARCH = getattr(GenerationMixin, _PATCH_TARGET)
 
 
 def enable_3_stages_gen():
-    GenerationMixin._greedy_search = _3_stages_greedy_search
+    if hasattr(GenerationMixin, "_greedy_search"):
+        GenerationMixin._greedy_search = _3_stages_greedy_search
+    else:
+        GenerationMixin._sample = _3_stages_sample
 
 
 def disable_3_stages_gen():
-    GenerationMixin._greedy_search = _OLD_GREEDY_SEARCH
+    setattr(GenerationMixin, _PATCH_TARGET, _OLD_GREEDY_SEARCH)
 
 
 def reset_q_input_ids(x=None):

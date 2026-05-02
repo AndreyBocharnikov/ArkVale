@@ -15,11 +15,12 @@ class PagePool:
 
     def __post_init__(self):
         buf_shape = (self.n_max_pages, *self.page_shape)
+        assert type(self.device) == str, (self.device, type(self.device))
         self.buffer = torch.empty(
             buf_shape,
             dtype=self.dtype,
             device=self.device,
-            pin_memory=(self.device.type == "cpu"),
+            pin_memory=(self.device == "cpu"),
         )
         self._free_ids = set(range(self.n_max_pages))
 

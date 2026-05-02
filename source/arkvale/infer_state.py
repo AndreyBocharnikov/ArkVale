@@ -20,7 +20,7 @@ class InferState:
         head_dim,
         page_size,
         dtype: torch.dtype,
-        device: torch.device,
+        device: str,
         page_budgets: Union[int, List[int]] = None,
         n_max_pages=None,
         n_unlimited_layers=None,
@@ -97,7 +97,7 @@ class InferState:
         self.kv_caches: List[KvCache] = [None] * self.n_layers
         self.dg_caches: List[KvCache] = [None] * self.n_layers
         self._cpu_pool = KvPool(
-            n_max_cpu_pages, page_size, n_kv_heads, head_dim, dtype, torch.device("cpu")
+            n_max_cpu_pages, page_size, n_kv_heads, head_dim, dtype, "cpu"
         )
         self.cpu_kv_caches: List[KvCache] = [None] * self.n_layers
         self.topk_dout: Tensor = None
@@ -223,12 +223,19 @@ class InferState:
             for dgc in self.dg_caches
             if dgc
         ]
-        n_dg_pages = (n_filled_kv_pages + self.page_size - 1) // self.page_size
-        self.dg_last_page_len = (n_filled_kv_pages - 1) % self.page_size + 1
-        self.dg_last_page_lens = torch.tensor(
-            [self.dg_last_page_len] * bsz, **self._i32
-        )
-        self.dg_indptrs = torch.arange(0, bsz * n_dg_pages + 1, n_dg_pages, **self._i32)
+        if n_filled_kv_pages > 0:
+            n_dg_pages = (n_filled_kv_pages + self.page_size - 1) // self.page_size
+            self.dg_last_page_len = (n_filled_kv_pages - 1) % self.page_size + 1
+            self.dg_last_page_lens = torch.tensor(
+                [self.dg_last_page_len] * bsz, **self._i32
+            )
+            self.dg_indptrs = torch.arange(
+                0, bsz * n_dg_pages + 1, n_dg_pages, **self._i32
+            )
+        else:
+            self.dg_last_page_len = 0
+            self.dg_last_page_lens = torch.zeros([bsz], **self._i32)
+            self.dg_indptrs = torch.zeros([bsz + 1], **self._i32)
 
         qo_indptr = torch.arange(0, bsz * q_len + 1, q_len, **self._i32)
         self.prefill_handler.begin_forward(
@@ -466,6 +473,8 @@ class InferState:
             return
         bsz, q_len, *_ = keys.shape
         n_filled_pages = (q_len + self.page_size - 1) // self.page_size - 1
+        if n_filled_pages <= 0:
+            return
         filled_keys = keys[:, : n_filled_pages * self.page_size, ...].reshape(
             bsz, n_filled_pages, self.page_size, self.n_kv_heads, self.head_dim
         )
