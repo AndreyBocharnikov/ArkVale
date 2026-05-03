@@ -8,6 +8,9 @@ from opencompass.models.huggingface_above_v4_33 import (
     _get_stopping_criteria,
 )
 from opencompass.registry import MODELS
+from transformers import AutoModel, AutoModelForCausalLM
+from arkvale import adapter
+import gc
 
 @MODELS.register_module()
 class ArkValeChatBot(HuggingFacewithChatTemplate):
@@ -16,7 +19,8 @@ class ArkValeChatBot(HuggingFacewithChatTemplate):
         path: str,
         page_size: int = 32,
         page_budgets: Optional[Union[int, List[int]]] = 4096 // 32,
-        page_topks: Optional[Union[int, List[int]]] = 32,
+        page_topks: Optional[int] = None,
+        token_budget: Optional[float] = None,
         n_max_pages: Optional[int] = None,
         n_max_bytes: int = 40 * (1 << 30),
         n_unlimited_layers: int = 2,
@@ -31,10 +35,13 @@ class ArkValeChatBot(HuggingFacewithChatTemplate):
         seed: Optional[int] = 42,
         **kwargs,
     ):
+        self.path = path
         self.dtype = torch.float16
         self.device: str = "cuda:0"
         
         self.seed = seed
+
+        assert page_topks is not None or token_budget is not None
 
         self.arkvale_kwargs = dict(
             page_size=page_size,
@@ -53,6 +60,9 @@ class ArkValeChatBot(HuggingFacewithChatTemplate):
             n_groups=n_groups,
         )
 
+        self.is_static_budget = self.arkvale_kwargs["page_topks"] is not None
+        self.token_budget = token_budget
+
         super().__init__(path, **kwargs)
 
     def _load_model(self,
@@ -60,7 +70,6 @@ class ArkValeChatBot(HuggingFacewithChatTemplate):
                     kwargs: dict,
                     peft_path: Optional[str] = None,
                     peft_kwargs: Optional[dict] = None):
-        from transformers import AutoModel, AutoModelForCausalLM
 
         self.model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=self.dtype, device_map=self.device)
         self.model.eval()
@@ -71,14 +80,13 @@ class ArkValeChatBot(HuggingFacewithChatTemplate):
         if self.tokenizer.pad_token_id is not None:
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
 
-        from arkvale import adapter
-
-        adapter.enable_arkvale(
-            self.model,
-            dtype=self.dtype,
-            device=self.device,
-            **self.arkvale_kwargs,
-        )
+        if self.is_static_budget:
+            adapter.enable_arkvale(
+                self.model,
+                dtype=self.dtype,
+                device=self.device,
+                **self.arkvale_kwargs,
+            )
 
     def generate(
         self,
@@ -103,9 +111,29 @@ class ArkValeChatBot(HuggingFacewithChatTemplate):
         )
 
         inputs = self.tokenizer.apply_chat_template(messages, **tokenize_kwargs).to(self.model.device)
+        in_seq_len = inputs.input_ids.shape[1]
+
+        if not self.is_static_budget:
+            page_topks = (int(self.token_budget * in_seq_len) + self.arkvale_kwargs["page_size"] - 1) // self.arkvale_kwargs["page_size"]
+            self.arkvale_kwargs["page_topks"] = page_topks + self.arkvale_kwargs["n_sink_pages"] + self.arkvale_kwargs["n_win_pages"] - 1
+
+            
+            torch.cuda.synchronize(self.device)
+            old_model = self.model
+            self.model = None
+            del old_model
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            self._load_model(self.path, dict())            
+            adapter.enable_arkvale(
+                self.model,
+                dtype=self.dtype,
+                device=self.device,
+                **self.arkvale_kwargs,
+            )
 
         with torch.no_grad():
-            in_seq_len = inputs.input_ids.shape[1]
             outputs = self.model.generate(**inputs, max_new_tokens=max_out_len, do_sample=False, **kwargs)
 
         outputs = outputs[:, in_seq_len:]
