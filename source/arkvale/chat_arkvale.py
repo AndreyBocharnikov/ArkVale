@@ -115,9 +115,10 @@ class ArkValeChatBot(HuggingFacewithChatTemplate):
 
         if not self.is_static_budget:
             page_topks = (int(self.token_budget * in_seq_len) + self.arkvale_kwargs["page_size"] - 1) // self.arkvale_kwargs["page_size"]
+            page_topks = max(page_topks, 1)
             self.arkvale_kwargs["page_topks"] = page_topks + self.arkvale_kwargs["n_sink_pages"] + self.arkvale_kwargs["n_win_pages"] - 1
+            self.arkvale_kwargs["page_budgets"] = self.arkvale_kwargs["page_topks"] + 1
 
-            
             torch.cuda.synchronize(self.device)
             old_model = self.model
             self.model = None
