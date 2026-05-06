@@ -9,6 +9,7 @@ from opencompass.models.huggingface_above_v4_33 import (
 )
 from opencompass.registry import MODELS
 from transformers import AutoModel, AutoModelForCausalLM
+from transformers.utils import logging as hf_logging
 from arkvale import adapter
 import gc
 
@@ -71,6 +72,7 @@ class ArkValeChatBot(HuggingFacewithChatTemplate):
                     peft_path: Optional[str] = None,
                     peft_kwargs: Optional[dict] = None):
 
+        hf_logging.disable_progress_bar()
         self.model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=self.dtype, device_map=self.device)
         self.model.eval()
 
