@@ -11,6 +11,21 @@ from . import utils
 Digest = Tuple[Tensor, Tensor]
 
 
+def repeat_kv(hidden_states: Tensor, n_rep: int) -> Tensor:
+    """
+    Equivalent to torch.repeat_interleave(hidden_states, dim=-2, repeats=n_rep).
+    The hidden states go from (..., num_key_value_heads, head_dim) to
+    (..., num_attention_heads, head_dim).
+    """
+    if n_rep == 1:
+        return hidden_states
+    *prefix, num_key_value_heads, head_dim = hidden_states.shape
+    hidden_states = hidden_states.unsqueeze(-2).expand(
+        *prefix, num_key_value_heads, n_rep, head_dim
+    )
+    return hidden_states.reshape(*prefix, num_key_value_heads * n_rep, head_dim)
+
+
 class InferState:
     def __init__(
         self,
@@ -203,6 +218,23 @@ class InferState:
     def batch_size(self):
         return self.kv_caches[0].batch_size
 
+    def _is_gqa3(self):
+        return self.n_qo_heads == self.n_kv_heads * 3
+
+    def _attn_n_kv_heads(self):
+        return self.n_qo_heads if self._is_gqa3() else self.n_kv_heads
+
+    def _prepare_kv_for_attn(self, kv_data: Tensor, page_ids: Tensor):
+        if not self._is_gqa3():
+            return kv_data, page_ids
+        flat_page_ids = page_ids.reshape(-1)
+        kv_data = kv_data.index_select(0, flat_page_ids.to(torch.int64))
+        kv_data = repeat_kv(kv_data, 3).contiguous()
+        page_ids = torch.arange(
+            flat_page_ids.numel(), device=page_ids.device, dtype=page_ids.dtype
+        ).reshape_as(page_ids)
+        return kv_data, page_ids
+
     def _prepare_prefill(self, bsz, q_len):
         self._pool.clear()
         self.kv_caches = [
@@ -276,7 +308,7 @@ class InferState:
             kv_indptr,
             self.kv_last_page_lens,
             self.n_qo_heads,
-            self.n_kv_heads,
+            self._attn_n_kv_heads(),
             self.head_dim,
         )
 
@@ -365,7 +397,7 @@ class InferState:
                 self.kv_decode_indptrs_tab[b],
                 self.kv_last_page_lens,
                 self.n_qo_heads,
-                self.n_kv_heads,
+                self._attn_n_kv_heads(),
                 self.head_dim,
                 self.page_size,
                 data_type=self.dtype,
@@ -416,10 +448,11 @@ class InferState:
         if n_groups is None:
             n_groups = self.n_groups
         dgc = self.dg_caches[layer_idx]
+        dg_data, dg_page_ids = self._prepare_kv_for_attn(dgc.buffer, dgc.c2p)
         return kernels.estimate_scores(
             query_states,
-            dgc.buffer,
-            dgc.c2p,
+            dg_data,
+            dg_page_ids,
             self.dg_indptrs,
             self.dg_last_page_lens,
             dgc.seq_len,
@@ -589,12 +622,14 @@ class InferState:
         kvc = self.kv_caches[layer_idx]
         if page_ids is None:
             page_ids = kvc.c2p
-        return self.prefill_handler.forward(q, kvc.buffer, page_ids)
+        kv_data, page_ids = self._prepare_kv_for_attn(kvc.buffer, page_ids)
+        return self.prefill_handler.forward(q, kv_data, page_ids)
 
     def decode_sdpa(self, layer_idx: int, q: Tensor, page_ids: Tensor = None):
         kvc = self.kv_caches[layer_idx]
         if page_ids is None:
             page_ids = kvc.c2p
+        kv_data, page_ids = self._prepare_kv_for_attn(kvc.buffer, page_ids)
         return self.decode_handler_tab[self.layer2base_budget[layer_idx]].forward(
-            q, kvc.buffer, page_ids
+            q, kv_data, page_ids
         )
